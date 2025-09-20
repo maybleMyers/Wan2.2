@@ -215,13 +215,35 @@ class WanAnimate:
         # Then, move non-Linear layers to GPU for compatibility
         def move_non_linear_to_gpu(module):
             for name, child in module.named_children():
+                # Skip RamTorchLinear layers (they manage their own device placement)
+                if RamTorchLinear and isinstance(child, RamTorchLinear):
+                    continue
+
+                # If module has children, recurse into it
                 if len(list(child.children())) > 0:
-                    # Recursively handle nested modules
                     move_non_linear_to_gpu(child)
-                elif not (RamTorchLinear and isinstance(child, RamTorchLinear)) and hasattr(child, 'weight'):
-                    # Move non-RamTorch layers with weights to GPU
-                    child.to(cuda_device)
-                    logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
+                else:
+                    # Move all non-RamTorch layers to GPU
+                    # This includes layers with weight, bias, or any parameters
+                    has_params = any(isinstance(p, nn.Parameter) for p in child.parameters())
+                    has_buffers = any(child.buffers())
+
+                    if has_params or has_buffers:
+                        child.to(cuda_device)
+                        logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
+
+            # Also handle direct parameters of the module (not in child modules)
+            for name, param in module.named_parameters(recurse=False):
+                if param.device != cuda_device:
+                    # This handles loose parameters not in submodules
+                    setattr(module, name, param.to(cuda_device))
+                    logging.info(f"Moved parameter {name} to GPU")
+
+            # Handle buffers as well
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.device != cuda_device:
+                    module.register_buffer(name, buffer.to(cuda_device))
+                    logging.info(f"Moved buffer {name} to GPU")
 
         move_non_linear_to_gpu(model)
 
