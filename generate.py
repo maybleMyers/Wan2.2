@@ -17,7 +17,7 @@ from PIL import Image
 
 import wan
 try:
-    from ramtorch.modules import Linear as RamTorchLinear
+    from RamTorch.ramtorch.modules import Linear as RamTorchLinear
     print("Successfully imported RamTorch.")
 except ImportError:
     RamTorchLinear = None
