@@ -9,6 +9,7 @@ from functools import partial
 from einops import rearrange
 import numpy as np
 import torch
+import torch.nn as nn
 
 import torch.distributed as dist
 from peft import set_peft_model_state_dict
@@ -31,6 +32,11 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+try:
+    from ramtorch_src.ramtorch.modules import linear as RamTorchLinear
+except ImportError:
+    RamTorchLinear = None
+
 
 
 class WanAnimate:
@@ -47,7 +53,8 @@ class WanAnimate:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
-        use_relighting_lora=False
+        use_relighting_lora=False,
+        use_ramtorch=False
     ):
         r"""
         Initializes the generation model components.
@@ -75,13 +82,16 @@ class WanAnimate:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
             use_relighting_lora (`bool`, *optional*, defaults to False):
-               Whether to use relighting lora for character replacement. 
+               Whether to use relighting lora for character replacement.
+            use_ramtorch (`bool`, *optional*, defaults to False):
+               Whether to use RamTorch memory optimization for inference.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.use_ramtorch = use_ramtorch
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -113,13 +123,24 @@ class WanAnimate:
         logging.info(f"Creating WanAnimate from {checkpoint_dir}")
 
         if not dit_fsdp:
-            self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
+            if self.use_ramtorch:
+                # Load model to CPU for RamTorch
+                self.noise_model = WanAnimateModel.from_pretrained(
+                    checkpoint_dir,
+                    torch_dtype=self.param_dtype,
+                    device_map='cpu')
+            else:
+                self.noise_model = WanAnimateModel.from_pretrained(
+                    checkpoint_dir,
+                    torch_dtype=self.param_dtype,
+                    device_map=self.device)
         else:
             self.noise_model = WanAnimateModel.from_pretrained(
                 checkpoint_dir, torch_dtype=self.param_dtype)
+
+        # Apply RamTorch replacement if enabled
+        if self.use_ramtorch:
+            self.noise_model = self._apply_ramtorch(self.noise_model, device_id)
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
@@ -139,6 +160,41 @@ class WanAnimate:
 
         self.sample_neg_prompt = config.sample_neg_prompt
         self.sample_prompt = config.prompt
+
+    def _apply_ramtorch(self, model, device_id):
+        """
+        Replace torch.nn.Linear layers with RamTorchLinear for memory-efficient inference.
+        """
+        if RamTorchLinear is None:
+            logging.warning("RamTorch is not installed. Skipping RamTorch optimization.")
+            return model
+
+        logging.info("Applying RamTorch memory optimization...")
+        device = f"cuda:{device_id}"
+
+        def replace_linear_with_ramtorch(module):
+            for name, child in module.named_children():
+                if isinstance(child, nn.Linear):
+                    # Create RamTorchLinear with same configuration
+                    new_module = RamTorchLinear(
+                        in_features=child.in_features,
+                        out_features=child.out_features,
+                        bias=child.bias is not None,
+                        device=device
+                    )
+                    # Copy weights and biases (RamTorch expects CPU tensors)
+                    new_module.weight.data.copy_(child.weight.data.cpu())
+                    if child.bias is not None:
+                        new_module.bias.data.copy_(child.bias.data.cpu())
+                    setattr(module, name, new_module)
+                    logging.info(f"Replaced {name} with RamTorchLinear")
+                elif len(list(child.children())) > 0:
+                    # Recursively replace in child modules
+                    replace_linear_with_ramtorch(child)
+
+        replace_linear_with_ramtorch(model)
+        logging.info("RamTorch optimization applied successfully.")
+        return model
 
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
@@ -193,7 +249,8 @@ class WanAnimate:
         else:
             if convert_model_dtype:
                 model.to(self.param_dtype)
-            if not self.init_on_cpu:
+            # Don't move model to GPU if using RamTorch (it manages GPU transfers internally)
+            if not self.init_on_cpu and not self.use_ramtorch:
                 model.to(self.device)
 
         return model
