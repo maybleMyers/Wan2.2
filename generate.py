@@ -15,11 +15,51 @@ import torch.distributed as dist
 from PIL import Image
 
 import wan
+try:
+    from ramtorch.modules import Linear as RamTorchLinear
+    print("Successfully imported RamTorch.")
+except ImportError:
+    RamTorchLinear = None
+    print("RamTorch not found. Running with standard torch.nn.Linear.")
+
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
+def replace_linear_with_ramtorch(model: nn.Module, device="cuda"):
+    """
+    Recursively iterates through all modules of a model and replaces
+    torch.nn.Linear with RamTorchLinear, copying weights and biases.
+    """
+    if RamTorchLinear is None:
+        print("RamTorch is not installed. Skipping replacement.")
+        return model
+
+    for name, module in model.named_children():
+        if len(list(module.children())) > 0:
+            # Recurse into submodule
+            replace_linear_with_ramtorch(module, device)
+
+        if isinstance(module, nn.Linear):
+            # Replace the linear layer
+            new_module = RamTorchLinear(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                bias=module.bias is not None,
+                device=device
+            )
+
+            # Copy weights and biases.
+            # RamTorchLinear expects parameters on CPU.
+            new_module.weight.data.copy_(module.weight.data.to("cpu"))
+            if module.bias is not None:
+                new_module.bias.data.copy_(module.bias.data.to("cpu"))
+
+            setattr(model, name, new_module)
+            print(f"Replaced {name} with RamTorchLinear.")
+    
+    return model
 
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
@@ -466,7 +506,12 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_relighting_lora=args.use_relighting_lora
         )
-
+        if RamTorchLinear is not None:
+            logging.info("Applying RamTorch memory optimization...")
+            # Move model to CPU first to ensure weights are accessible before replacement
+            wan_animate.dit.to('cpu') 
+            replace_linear_with_ramtorch(wan_animate.dit, device=device)
+            logging.info("RamTorch optimization applied.")
         logging.info(f"Generating video ...")
         video = wan_animate.generate(
             src_root_path=args.src_root_path,
