@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 from datetime import datetime
+import torch.nn as nn
 
 warnings.filterwarnings('ignore')
 
@@ -145,6 +146,12 @@ def _validate_args(args):
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a image or video from a text prompt or image using Wan"
+    )
+    parser.add_argument(
+        "--use_ramtorch",
+        action="store_true",
+        default=False,
+        help="Enable RamTorch memory optimization by replacing Linear layers."
     )
     parser.add_argument(
         "--task",
@@ -506,12 +513,16 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_relighting_lora=args.use_relighting_lora
         )
-        if RamTorchLinear is not None:
-            logging.info("Applying RamTorch memory optimization...")
-            # Move model to CPU first to ensure weights are accessible before replacement
-            wan_animate.dit.to('cpu') 
-            replace_linear_with_ramtorch(wan_animate.dit, device=device)
-            logging.info("RamTorch optimization applied.")
+        if args.use_ramtorch:
+            if RamTorchLinear is not None:
+                logging.info("Applying RamTorch memory optimization...")
+                model_to_optimize = wan_animate.noise_model
+                model_to_optimize.to('cpu')
+                replace_linear_with_ramtorch(model_to_optimize, device=f"cuda:{device}")
+                model_to_optimize.to(device)
+                logging.info("RamTorch optimization applied successfully.")
+            else:
+                logging.warning("RamTorch is not installed. --use_ramtorch flag will be ignored.")
         logging.info(f"Generating video ...")
         video = wan_animate.generate(
             src_root_path=args.src_root_path,
