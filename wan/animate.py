@@ -144,7 +144,7 @@ class WanAnimate:
 
             # Offload VAE and CLIP to CPU to save GPU memory
             logging.info("Offloading VAE and CLIP to CPU for RamTorch memory optimization")
-            self.vae.vae = self.vae.vae.cpu()
+            self.vae.model = self.vae.model.cpu()
             self.clip.model = self.clip.model.cpu()
             logging.info("VAE and CLIP offloaded to CPU")
 
@@ -587,7 +587,7 @@ class WanAnimate:
 
                 # Move VAE to GPU if using RamTorch
                 if self.use_ramtorch:
-                    self.vae.vae = self.vae.vae.to(self.device)
+                    self.vae.model = self.vae.model.to(self.device)
 
                 pose_latents_no_ref =  self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
                 pose_latents_no_ref = torch.stack(pose_latents_no_ref)
@@ -728,7 +728,7 @@ class WanAnimate:
 
                 # Move VAE back to CPU after decoding if using RamTorch
                 if self.use_ramtorch:
-                    self.vae.vae = self.vae.vae.cpu()
+                    self.vae.model = self.vae.model.cpu()
                 
                 if start != 0:
                     out_frames = out_frames[:, :, refert_num:]
