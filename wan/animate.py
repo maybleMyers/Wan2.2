@@ -226,7 +226,7 @@ class WanAnimate:
                     # Move all non-RamTorch layers to GPU
                     # This includes layers with weight, bias, or any parameters
                     has_params = any(isinstance(p, nn.Parameter) for p in child.parameters())
-                    has_buffers = any(child.buffers())
+                    has_buffers = len(list(child.buffers())) > 0
 
                     if has_params or has_buffers:
                         child.to(cuda_device)
