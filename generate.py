@@ -333,9 +333,15 @@ def generate(args):
     _init_logging(rank)
 
     if args.offload_model is None:
-        args.offload_model = False if world_size > 1 else True
-        logging.info(
-            f"offload_model is not specified, set to {args.offload_model}.")
+        # Disable offload_model when using RamTorch (it handles memory management)
+        if args.use_ramtorch:
+            args.offload_model = False
+            logging.info(
+                f"offload_model disabled when using RamTorch (RamTorch handles memory management).")
+        else:
+            args.offload_model = False if world_size > 1 else True
+            logging.info(
+                f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(

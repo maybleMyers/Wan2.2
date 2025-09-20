@@ -164,6 +164,7 @@ class WanAnimate:
     def _apply_ramtorch(self, model, device_id):
         """
         Replace torch.nn.Linear layers with RamTorchLinear for memory-efficient inference.
+        Non-Linear layers are moved to GPU for compatibility.
         """
         if RamTorchLinear is None:
             logging.warning("RamTorch is not installed. Skipping RamTorch optimization.")
@@ -171,6 +172,7 @@ class WanAnimate:
 
         logging.info("Applying RamTorch memory optimization...")
         device = f"cuda:{device_id}"
+        cuda_device = torch.device(device)
 
         def replace_linear_with_ramtorch(module):
             for name, child in module.named_children():
@@ -192,7 +194,22 @@ class WanAnimate:
                     # Recursively replace in child modules
                     replace_linear_with_ramtorch(child)
 
+        # First, replace all Linear layers with RamTorchLinear
         replace_linear_with_ramtorch(model)
+
+        # Then, move non-Linear layers to GPU for compatibility
+        def move_non_linear_to_gpu(module):
+            for name, child in module.named_children():
+                if len(list(child.children())) > 0:
+                    # Recursively handle nested modules
+                    move_non_linear_to_gpu(child)
+                elif not (RamTorchLinear and isinstance(child, RamTorchLinear)) and hasattr(child, 'weight'):
+                    # Move non-RamTorch layers with weights to GPU
+                    child.to(cuda_device)
+                    logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
+
+        move_non_linear_to_gpu(model)
+
         logging.info("RamTorch optimization applied successfully.")
         return model
 
