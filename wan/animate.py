@@ -33,7 +33,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 try:
-    from ramtorch_src.ramtorch.modules import linear as RamTorchLinear
+    from ramtorch_src.ramtorch.modules.linear import Linear as RamTorchLinear
 except ImportError:
     RamTorchLinear = None
 
