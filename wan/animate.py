@@ -142,11 +142,20 @@ class WanAnimate:
         if self.use_ramtorch:
             self.noise_model = self._apply_ramtorch(self.noise_model, device_id)
 
-            # Offload VAE and CLIP to CPU to save GPU memory
-            logging.info("Offloading VAE and CLIP to CPU for RamTorch memory optimization")
+            # Offload VAE, CLIP, and T5 to CPU to save GPU memory
+            logging.info("Offloading VAE, CLIP, and T5 to CPU for RamTorch memory optimization")
             self.vae.model = self.vae.model.cpu()
+            # Also move VAE scale tensors to CPU
+            self.vae.mean = self.vae.mean.cpu()
+            self.vae.std = self.vae.std.cpu()
+            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+            self.vae.device = torch.device('cpu')
+
             self.clip.model = self.clip.model.cpu()
-            logging.info("VAE and CLIP offloaded to CPU")
+            # Force T5 to CPU as well (it's a huge model)
+            self.text_encoder.model = self.text_encoder.model.cpu()
+            self.t5_cpu = True  # Mark T5 as being on CPU
+            logging.info("VAE, CLIP, and T5 offloaded to CPU")
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
@@ -588,6 +597,11 @@ class WanAnimate:
                 # Move VAE to GPU if using RamTorch
                 if self.use_ramtorch:
                     self.vae.model = self.vae.model.to(self.device)
+                    # Also move VAE scale tensors to GPU
+                    self.vae.mean = self.vae.mean.to(self.device)
+                    self.vae.std = self.vae.std.to(self.device)
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = self.device
 
                 pose_latents_no_ref =  self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
                 pose_latents_no_ref = torch.stack(pose_latents_no_ref)
@@ -729,6 +743,11 @@ class WanAnimate:
                 # Move VAE back to CPU after decoding if using RamTorch
                 if self.use_ramtorch:
                     self.vae.model = self.vae.model.cpu()
+                    # Also move scale tensors back to CPU
+                    self.vae.mean = self.vae.mean.cpu()
+                    self.vae.std = self.vae.std.cpu()
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = torch.device('cpu')
                 
                 if start != 0:
                     out_frames = out_frames[:, :, refert_num:]
