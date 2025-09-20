@@ -142,6 +142,12 @@ class WanAnimate:
         if self.use_ramtorch:
             self.noise_model = self._apply_ramtorch(self.noise_model, device_id)
 
+            # Offload VAE and CLIP to CPU to save GPU memory
+            logging.info("Offloading VAE and CLIP to CPU for RamTorch memory optimization")
+            self.vae.vae = self.vae.vae.cpu()
+            self.clip.model = self.clip.model.cpu()
+            logging.info("VAE and CLIP offloaded to CPU")
+
         self.noise_model = self._configure_model(
             model=self.noise_model,
             use_sp=use_sp,
@@ -579,6 +585,10 @@ class WanAnimate:
 
                 latents = noise
 
+                # Move VAE to GPU if using RamTorch
+                if self.use_ramtorch:
+                    self.vae.vae = self.vae.vae.to(self.device)
+
                 pose_latents_no_ref =  self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
                 pose_latents_no_ref = torch.stack(pose_latents_no_ref)
                 pose_latents = torch.cat([pose_latents_no_ref], dim=2)
@@ -591,7 +601,13 @@ class WanAnimate:
                 y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=self.device)
 
                 img = ref_pixel_values[0, :, 0]
+                # Move CLIP to GPU if using RamTorch
+                if self.use_ramtorch:
+                    self.clip.model = self.clip.model.to(self.device)
                 clip_context = self.clip.visual([img[:, None, :, :]]).to(dtype=torch.bfloat16, device=self.device)
+                # Move CLIP back to CPU after use
+                if self.use_ramtorch:
+                    self.clip.model = self.clip.model.cpu()
 
                 if mask_reft_len > 0:
                     if replace_flag:
@@ -709,6 +725,10 @@ class WanAnimate:
 
                 x0 = [x.to(dtype=torch.float32) for x in x0]
                 out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))
+
+                # Move VAE back to CPU after decoding if using RamTorch
+                if self.use_ramtorch:
+                    self.vae.vae = self.vae.vae.cpu()
                 
                 if start != 0:
                     out_frames = out_frames[:, :, refert_num:]
