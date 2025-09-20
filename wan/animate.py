@@ -236,7 +236,7 @@ class WanAnimate:
             for name, param in module.named_parameters(recurse=False):
                 if param.device != cuda_device:
                     # This handles loose parameters not in submodules
-                    setattr(module, name, param.to(cuda_device))
+                    setattr(module, name, nn.Parameter(param.to(cuda_device)))
                     logging.info(f"Moved parameter {name} to GPU")
 
             # Handle buffers as well
