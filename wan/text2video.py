@@ -99,6 +99,7 @@ class WanT2V:
         self.use_ramtorch = use_ramtorch
         self.dynamic_dit_loading = dynamic_dit_loading
         self.mixed_dtype = mixed_dtype
+        self.convert_model_dtype = convert_model_dtype
 
         # Store individual model paths
         self.dit_low_noise_path = dit_low_noise_path
