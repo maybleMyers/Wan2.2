@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
+import torch.nn as nn
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
@@ -29,6 +30,11 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+try:
+    from RamTorch.ramtorch.modules.linear import Linear as RamTorchLinear
+except ImportError:
+    RamTorchLinear = None
+
 
 class WanI2V:
 
@@ -44,6 +50,7 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        use_ramtorch=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -70,12 +77,15 @@ class WanI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            use_ramtorch (`bool`, *optional*, defaults to False):
+                Whether to use RamTorch memory optimization for inference.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.use_ramtorch = use_ramtorch
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -101,8 +111,21 @@ class WanI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
+
+        # Load models to CPU if using RamTorch
+        if self.use_ramtorch:
+            self.low_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.low_noise_checkpoint,
+                device_map='cpu')
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint,
+                device_map='cpu')
+        else:
+            self.low_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.low_noise_checkpoint)
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint)
+
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
             use_sp=use_sp,
@@ -110,14 +133,22 @@ class WanI2V:
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
         self.high_noise_model = self._configure_model(
             model=self.high_noise_model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+
+        # Apply RamTorch replacement if enabled
+        if self.use_ramtorch:
+            self.low_noise_model = self._apply_ramtorch(self.low_noise_model, device_id)
+            self.high_noise_model = self._apply_ramtorch(self.high_noise_model, device_id)
+
+            # Offload VAE to CPU to save GPU memory
+            logging.info("Offloading VAE to CPU for RamTorch memory optimization")
+            self.vae = self.vae.to('cpu')
+            logging.info("VAE offloaded to CPU")
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -164,9 +195,84 @@ class WanI2V:
         else:
             if convert_model_dtype:
                 model.to(self.param_dtype)
-            if not self.init_on_cpu:
+            # Don't move model to GPU if using RamTorch (it manages GPU transfers internally)
+            if not self.init_on_cpu and not self.use_ramtorch:
                 model.to(self.device)
 
+        return model
+
+    def _apply_ramtorch(self, model, device_id):
+        """
+        Replace torch.nn.Linear layers with RamTorchLinear for memory-efficient inference.
+        Non-Linear layers are moved to GPU for compatibility.
+        """
+        if RamTorchLinear is None:
+            logging.warning("RamTorch is not installed. Skipping RamTorch optimization.")
+            return model
+
+        logging.info("Applying RamTorch memory optimization...")
+        device = f"cuda:{device_id}"
+        cuda_device = torch.device(device)
+
+        def replace_linear_with_ramtorch(module):
+            for name, child in module.named_children():
+                if isinstance(child, nn.Linear):
+                    # Create RamTorchLinear with same configuration
+                    new_module = RamTorchLinear(
+                        in_features=child.in_features,
+                        out_features=child.out_features,
+                        bias=child.bias is not None,
+                        device=device
+                    )
+                    # Copy weights and biases (RamTorch expects CPU tensors)
+                    new_module.weight.data.copy_(child.weight.data.cpu())
+                    if child.bias is not None:
+                        new_module.bias.data.copy_(child.bias.data.cpu())
+                    setattr(module, name, new_module)
+                    logging.info(f"Replaced {name} with RamTorchLinear")
+                elif len(list(child.children())) > 0:
+                    # Recursively replace in child modules
+                    replace_linear_with_ramtorch(child)
+
+        # First, replace all Linear layers with RamTorchLinear
+        replace_linear_with_ramtorch(model)
+
+        # Then, move non-Linear layers to GPU for compatibility
+        def move_non_linear_to_gpu(module):
+            for name, child in module.named_children():
+                # Skip RamTorchLinear layers (they manage their own device placement)
+                if RamTorchLinear and isinstance(child, RamTorchLinear):
+                    continue
+
+                # If module has children, recurse into it
+                if len(list(child.children())) > 0:
+                    move_non_linear_to_gpu(child)
+                else:
+                    # Move all non-RamTorch layers to GPU
+                    # This includes layers with weight, bias, or any parameters
+                    has_params = any(isinstance(p, nn.Parameter) for p in child.parameters())
+                    has_buffers = len(list(child.buffers())) > 0
+
+                    if has_params or has_buffers:
+                        child.to(cuda_device)
+                        logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
+
+            # Also handle direct parameters of the module (not in child modules)
+            for name, param in module.named_parameters(recurse=False):
+                if param.device != cuda_device:
+                    # This handles loose parameters not in submodules
+                    setattr(module, name, nn.Parameter(param.to(cuda_device)))
+                    logging.info(f"Moved parameter {name} to GPU")
+
+            # Handle buffers as well
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.device != cuda_device:
+                    module.register_buffer(name, buffer.to(cuda_device))
+                    logging.info(f"Moved buffer {name} to GPU")
+
+        move_non_linear_to_gpu(model)
+
+        logging.info("RamTorch optimization applied successfully.")
         return model
 
     def _prepare_model_for_timestep(self, t, boundary, offload_model):
@@ -311,6 +417,10 @@ class WanI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
+        # Move VAE to GPU if using RamTorch
+        if self.use_ramtorch:
+            self.vae = self.vae.to(self.device)
+
         y = self.vae.encode([
             torch.concat([
                 torch.nn.functional.interpolate(
@@ -321,6 +431,10 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+
+        # Move VAE back to CPU after encoding if using RamTorch
+        if self.use_ramtorch:
+            self.vae = self.vae.to('cpu')
 
         @contextmanager
         def noop_no_sync():
@@ -418,7 +532,13 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
+                # Move VAE to GPU if using RamTorch
+                if self.use_ramtorch:
+                    self.vae = self.vae.to(self.device)
                 videos = self.vae.decode(x0)
+                # Move VAE back to CPU after decoding if using RamTorch
+                if self.use_ramtorch:
+                    self.vae = self.vae.to('cpu')
 
         del noise, latent, x0
         del sample_scheduler

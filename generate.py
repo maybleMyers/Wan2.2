@@ -17,7 +17,7 @@ from PIL import Image
 
 import wan
 try:
-    from ramtorch_src.ramtorch.modules.linear import Linear as RamTorchLinear
+    from RamTorch.ramtorch.modules.linear import Linear as RamTorchLinear
     print("Successfully imported RamTorch.")
 except ImportError:
     RamTorchLinear = None
@@ -544,6 +544,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            use_ramtorch=args.use_ramtorch,
         )
         logging.info("Generating video ...")
         video = wan_i2v.generate(
