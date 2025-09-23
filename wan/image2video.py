@@ -163,9 +163,9 @@ class WanI2V:
         # Initialize CLIP model for i2v-A14B if path is provided
         self.clip_model = None
         if self.clip_path:
-            # Import CLIPModel if needed
+            # Import CLIPModel from animate module
             try:
-                from .modules.clip import CLIPModel
+                from .modules.animate.clip import CLIPModel
                 clip_tokenizer_path = config.clip_tokenizer if hasattr(config, 'clip_tokenizer') else None
                 self.clip_model = CLIPModel(
                     dtype=config.clip_dtype if hasattr(config, 'clip_dtype') else torch.float16,
@@ -175,8 +175,8 @@ class WanI2V:
                     weight_path=self.clip_path,
                 )
                 logging.info(f"Loaded CLIP model from {self.clip_path}")
-            except ImportError:
-                logging.warning("CLIP module not found, skipping CLIP loading")
+            except ImportError as e:
+                logging.warning(f"CLIP module import failed: {e}, skipping CLIP loading")
 
         if self.dynamic_dit_loading:
             logging.info(f"Dynamic DiT loading enabled - models will be loaded on demand")
@@ -202,22 +202,41 @@ class WanI2V:
             def _load_wan_model(path_or_dir, subfolder=None):
                 # Check if individual path is provided and is a file
                 if path_or_dir and os.path.isfile(path_or_dir) and (path_or_dir.endswith('.safetensors') or path_or_dir.endswith('.pth')):
-                    try:
-                        from .modules.ram_model import load_wan_model
-                        loading_device = 'cpu' if self.use_ramtorch else self.device
-                        loading_weight_dtype = None if self.mixed_dtype else self.param_dtype
-                        return load_wan_model(
-                            config=self.config,
-                            device=self.device,
-                            dit_path=path_or_dir,
-                            attn_mode='sdpa',
-                            split_attn=False,
-                            loading_device=loading_device,
-                            dit_weight_dtype=loading_weight_dtype,
-                            fp8_scaled=False,
-                        )
-                    except ImportError:
-                        logging.warning("ram_model not found, falling back to from_pretrained")
+                    logging.info(f"Loading model from file: {path_or_dir}")
+
+                    # Create model instance using config
+                    model = WanModel(
+                        model_type="i2v",  # for i2v-A14B
+                        patch_size=self.config.patch_size,
+                        text_len=self.config.text_len,
+                        in_dim=16,  # Standard VAE latent channels
+                        dim=self.config.dim,
+                        ffn_dim=self.config.ffn_dim,
+                        freq_dim=self.config.freq_dim,
+                        text_dim=4096,  # Standard T5 dimension
+                        num_heads=self.config.num_heads,
+                        num_layers=self.config.num_layers,
+                        window_size=self.config.window_size,
+                        qk_norm=self.config.qk_norm,
+                        cross_attn_norm=self.config.cross_attn_norm,
+                        eps=self.config.eps,
+                    )
+
+                    # Load weights
+                    if path_or_dir.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(path_or_dir, device='cpu' if self.use_ramtorch else str(self.device))
+                    else:
+                        state_dict = torch.load(path_or_dir, map_location='cpu' if self.use_ramtorch else self.device)
+
+                    # Load state dict into model
+                    model.load_state_dict(state_dict, strict=True)
+
+                    # Move to appropriate device if not using RamTorch
+                    if not self.use_ramtorch:
+                        model = model.to(self.device)
+
+                    return model
 
                 # Fall back to directory loading
                 if self.use_ramtorch:
@@ -479,35 +498,40 @@ class WanI2V:
 
         # Check if this is a single file (safetensors/pth) or a directory
         if os.path.isfile(checkpoint_path) and (checkpoint_path.endswith('.safetensors') or checkpoint_path.endswith('.pth')):
-            # Use load_wan_model from ram_model for single file loading
-            try:
-                from .modules.ram_model import load_wan_model
+            # Load safetensors file directly
+            logging.info(f"Loading safetensors/pth file directly from {checkpoint_path}")
 
-                loading_device = 'cpu' if (self.use_ramtorch or self.init_on_cpu) else self.device
-                loading_weight_dtype = None if self.mixed_dtype else self.param_dtype
+            # Create model instance using config
+            model = WanModel(
+                model_type="i2v",  # for i2v-A14B
+                patch_size=self.config.patch_size,
+                text_len=self.config.text_len,
+                in_dim=16,  # Standard VAE latent channels
+                dim=self.config.dim,
+                ffn_dim=self.config.ffn_dim,
+                freq_dim=self.config.freq_dim,
+                text_dim=4096,  # Standard T5 dimension
+                num_heads=self.config.num_heads,
+                num_layers=self.config.num_layers,
+                window_size=self.config.window_size,
+                qk_norm=self.config.qk_norm,
+                cross_attn_norm=self.config.cross_attn_norm,
+                eps=self.config.eps,
+            )
 
-                model = load_wan_model(
-                    config=self.config,
-                    device=self.device,
-                    dit_path=checkpoint_path,
-                    attn_mode='sdpa',  # Default attention mode
-                    split_attn=False,
-                    loading_device=loading_device,
-                    dit_weight_dtype=loading_weight_dtype,
-                    fp8_scaled=False,
-                )
-            except ImportError:
-                logging.warning("ram_model not found, falling back to from_pretrained")
-                # Fallback to from_pretrained with directory structure
-                if self.use_ramtorch or self.init_on_cpu:
-                    model = WanModel.from_pretrained(
-                        self.checkpoint_dir,
-                        subfolder=os.path.basename(checkpoint_path),
-                        device_map='cpu')
-                else:
-                    model = WanModel.from_pretrained(
-                        self.checkpoint_dir,
-                        subfolder=os.path.basename(checkpoint_path))
+            # Load weights
+            if checkpoint_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(checkpoint_path, device='cpu' if (self.use_ramtorch or self.init_on_cpu) else str(self.device))
+            else:
+                state_dict = torch.load(checkpoint_path, map_location='cpu' if (self.use_ramtorch or self.init_on_cpu) else self.device)
+
+            # Load state dict into model
+            model.load_state_dict(state_dict, strict=True)
+
+            # Move to appropriate device if not already there
+            if not (self.use_ramtorch or self.init_on_cpu):
+                model = model.to(self.device)
         else:
             # Load from directory structure (original behavior)
             if self.use_ramtorch or self.init_on_cpu:
