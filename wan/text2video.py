@@ -365,6 +365,19 @@ class WanT2V:
                         child.to(cuda_device)
                         logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
 
+            # Also handle direct parameters of the module (not in child modules)
+            for name, param in module.named_parameters(recurse=False):
+                if param.device != cuda_device:
+                    # This handles loose parameters not in submodules
+                    setattr(module, name, nn.Parameter(param.to(cuda_device)))
+                    logging.info(f"Moved parameter {name} to GPU")
+
+            # Handle buffers as well
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.device != cuda_device:
+                    module.register_buffer(name, buffer.to(cuda_device))
+                    logging.info(f"Moved buffer {name} to GPU")
+
         move_non_linear_to_gpu(model)
 
         logging.info("RamTorch optimization applied successfully.")
