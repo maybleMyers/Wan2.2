@@ -68,7 +68,19 @@ EXAMPLE_PROMPT = {
 
 def _validate_args(args):
     # Basic check
-    assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
+    # Allow either checkpoint directory or individual model paths
+    if args.ckpt_dir is None:
+        # Check if individual model paths are provided for A14B models
+        if "A14B" in args.task:
+            if args.dit_low_noise is None or args.dit_high_noise is None:
+                assert False, "Please specify either --ckpt_dir or both --dit_low_noise and --dit_high_noise for A14B models"
+            if args.vae is None or args.t5 is None:
+                assert False, "Please specify --vae and --t5 when using individual model paths"
+            if args.task == "i2v-A14B" and args.clip is None:
+                assert False, "Please specify --clip for i2v-A14B when using individual model paths"
+        else:
+            assert False, "Please specify the checkpoint directory (--ckpt_dir) or individual model paths"
+
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
@@ -313,6 +325,45 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+
+    # Individual model path arguments for single safetensors loading
+    parser.add_argument(
+        "--dit_low_noise",
+        type=str,
+        default=None,
+        help="Path to low noise DiT model checkpoint (safetensors or pth file)"
+    )
+    parser.add_argument(
+        "--dit_high_noise",
+        type=str,
+        default=None,
+        help="Path to high noise DiT model checkpoint (safetensors or pth file)"
+    )
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default=None,
+        help="Path to VAE checkpoint (safetensors or pth file)"
+    )
+    parser.add_argument(
+        "--t5",
+        type=str,
+        default=None,
+        help="Path to T5 text encoder checkpoint (safetensors or pth file)"
+    )
+    parser.add_argument(
+        "--clip",
+        type=str,
+        default=None,
+        help="Path to CLIP model checkpoint (safetensors or pth file)"
+    )
+    parser.add_argument(
+        "--mixed_dtype",
+        action="store_true",
+        default=False,
+        help="Preserve original weight dtypes when loading models (mixed fp16/fp32)"
+    )
+
     args = parser.parse_args()
     _validate_args(args)
 
@@ -552,6 +603,13 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_ramtorch=args.use_ramtorch,
             dynamic_dit_loading=args.dynamic_dit_loading,
+            # Individual model paths
+            dit_low_noise_path=args.dit_low_noise,
+            dit_high_noise_path=args.dit_high_noise,
+            vae_path=args.vae,
+            t5_path=args.t5,
+            clip_path=args.clip,
+            mixed_dtype=args.mixed_dtype,
         )
         logging.info("Generating video ...")
         video = wan_i2v.generate(

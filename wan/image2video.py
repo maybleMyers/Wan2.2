@@ -52,6 +52,13 @@ class WanI2V:
         convert_model_dtype=False,
         use_ramtorch=False,
         dynamic_dit_loading=False,
+        # Individual model paths for single safetensors loading
+        dit_low_noise_path=None,
+        dit_high_noise_path=None,
+        vae_path=None,
+        t5_path=None,
+        clip_path=None,
+        mixed_dtype=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -82,6 +89,18 @@ class WanI2V:
                 Whether to use RamTorch memory optimization for inference.
             dynamic_dit_loading (`bool`, *optional*, defaults to False):
                 Load only one DiT model at a time during inference.
+            dit_low_noise_path (`str`, *optional*):
+                Path to low noise DiT model checkpoint (safetensors or pth file).
+            dit_high_noise_path (`str`, *optional*):
+                Path to high noise DiT model checkpoint (safetensors or pth file).
+            vae_path (`str`, *optional*):
+                Path to VAE checkpoint (safetensors or pth file).
+            t5_path (`str`, *optional*):
+                Path to T5 text encoder checkpoint (safetensors or pth file).
+            clip_path (`str`, *optional*):
+                Path to CLIP model checkpoint (safetensors or pth file).
+            mixed_dtype (`bool`, *optional*, defaults to False):
+                Preserve original weight dtypes when loading models.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -93,6 +112,14 @@ class WanI2V:
         self.checkpoint_dir = checkpoint_dir
         self.device_id = device_id
         self.convert_model_dtype = convert_model_dtype
+        self.mixed_dtype = mixed_dtype
+
+        # Store individual model paths
+        self.dit_low_noise_path = dit_low_noise_path
+        self.dit_high_noise_path = dit_high_noise_path
+        self.vae_path = vae_path
+        self.t5_path = t5_path
+        self.clip_path = clip_path
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -102,19 +129,30 @@ class WanI2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
+        # Use individual T5 path if provided, otherwise use checkpoint directory
+        if self.t5_path:
+            t5_checkpoint_path = self.t5_path
+            # Use default tokenizer path or extract from config if needed
+            t5_tokenizer_path = config.t5_tokenizer if hasattr(config, 't5_tokenizer') else "google/umt5-xxl"
+        else:
+            t5_checkpoint_path = os.path.join(checkpoint_dir, config.t5_checkpoint)
+            t5_tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
+
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            checkpoint_path=t5_checkpoint_path,
+            tokenizer_path=t5_tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None,
         )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        # Use individual VAE path if provided, otherwise use checkpoint directory
+        vae_pth = self.vae_path if self.vae_path else os.path.join(checkpoint_dir, config.vae_checkpoint)
         self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=vae_pth,
             device=self.device)
 
         # Store model configuration for dynamic loading
@@ -122,11 +160,36 @@ class WanI2V:
         self.dit_fsdp = dit_fsdp
         self.shard_fn = shard_fn
 
+        # Initialize CLIP model for i2v-A14B if path is provided
+        self.clip_model = None
+        if self.clip_path:
+            # Import CLIPModel if needed
+            try:
+                from .modules.clip import CLIPModel
+                clip_tokenizer_path = config.clip_tokenizer if hasattr(config, 'clip_tokenizer') else None
+                self.clip_model = CLIPModel(
+                    dtype=config.clip_dtype if hasattr(config, 'clip_dtype') else torch.float16,
+                    device=self.device,
+                    checkpoint_path=None,  # We'll load from weight_path
+                    tokenizer_path=clip_tokenizer_path,
+                    weight_path=self.clip_path,
+                )
+                logging.info(f"Loaded CLIP model from {self.clip_path}")
+            except ImportError:
+                logging.warning("CLIP module not found, skipping CLIP loading")
+
         if self.dynamic_dit_loading:
             logging.info(f"Dynamic DiT loading enabled - models will be loaded on demand")
-            # Store model paths but don't load models yet
-            self.low_noise_checkpoint = os.path.join(checkpoint_dir, config.low_noise_checkpoint)
-            self.high_noise_checkpoint = os.path.join(checkpoint_dir, config.high_noise_checkpoint)
+            # Store model paths - use individual paths if provided, otherwise use checkpoint directory
+            if self.dit_low_noise_path and self.dit_high_noise_path:
+                self.low_noise_checkpoint = self.dit_low_noise_path
+                self.high_noise_checkpoint = self.dit_high_noise_path
+                logging.info(f"Using individual DiT model paths:")
+                logging.info(f"  Low noise: {self.low_noise_checkpoint}")
+                logging.info(f"  High noise: {self.high_noise_checkpoint}")
+            else:
+                self.low_noise_checkpoint = os.path.join(checkpoint_dir, config.low_noise_checkpoint)
+                self.high_noise_checkpoint = os.path.join(checkpoint_dir, config.high_noise_checkpoint)
 
             # Initialize model references
             self.low_noise_model = None
