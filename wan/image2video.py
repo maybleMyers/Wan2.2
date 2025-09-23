@@ -166,13 +166,12 @@ class WanI2V:
             # Import CLIPModel from animate module
             try:
                 from .modules.animate.clip import CLIPModel
-                clip_tokenizer_path = config.clip_tokenizer if hasattr(config, 'clip_tokenizer') else None
+                clip_tokenizer_path = config.clip_tokenizer if hasattr(config, 'clip_tokenizer') else "xlm-roberta-large"
                 self.clip_model = CLIPModel(
                     dtype=config.clip_dtype if hasattr(config, 'clip_dtype') else torch.float16,
                     device=self.device,
-                    checkpoint_path=None,  # We'll load from weight_path
+                    checkpoint_path=self.clip_path,  # Use the provided path directly
                     tokenizer_path=clip_tokenizer_path,
-                    weight_path=self.clip_path,
                 )
                 logging.info(f"Loaded CLIP model from {self.clip_path}")
             except ImportError as e:
