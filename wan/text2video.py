@@ -151,6 +151,17 @@ class WanT2V:
             vae_pth=vae_pth,
             device=vae_device)
 
+        # Explicitly offload VAE when using RamTorch
+        if use_ramtorch:
+            logging.info("Offloading VAE to CPU for RamTorch memory optimization")
+            self.vae.model = self.vae.model.cpu()
+            # Also move VAE scale tensors to CPU
+            self.vae.mean = self.vae.mean.cpu()
+            self.vae.std = self.vae.std.cpu()
+            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+            self.vae.device = torch.device('cpu')
+            logging.info("VAE offloaded to CPU")
+
         # Store model configuration for potential dynamic loading
         self.use_sp = use_sp
         self.dit_fsdp = dit_fsdp
@@ -260,16 +271,6 @@ class WanT2V:
             if self.use_ramtorch:
                 self.low_noise_model = self._apply_ramtorch(self.low_noise_model, device_id)
                 self.high_noise_model = self._apply_ramtorch(self.high_noise_model, device_id)
-
-                # Offload VAE to CPU to save GPU memory
-                logging.info("Offloading VAE to CPU for RamTorch memory optimization")
-                self.vae.model = self.vae.model.cpu()
-                # Also move VAE scale tensors to CPU
-                self.vae.mean = self.vae.mean.cpu()
-                self.vae.std = self.vae.std.cpu()
-                self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
-                self.vae.device = torch.device('cpu')
-                logging.info("VAE offloaded to CPU")
         if use_sp:
             self.sp_size = get_world_size()
         else:
