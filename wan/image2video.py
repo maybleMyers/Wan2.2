@@ -51,6 +51,7 @@ class WanI2V:
         init_on_cpu=True,
         convert_model_dtype=False,
         use_ramtorch=False,
+        dynamic_dit_loading=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -79,6 +80,8 @@ class WanI2V:
                 Only works without FSDP.
             use_ramtorch (`bool`, *optional*, defaults to False):
                 Whether to use RamTorch memory optimization for inference.
+            dynamic_dit_loading (`bool`, *optional*, defaults to False):
+                Load only one DiT model at a time during inference.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -86,6 +89,10 @@ class WanI2V:
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
         self.use_ramtorch = use_ramtorch
+        self.dynamic_dit_loading = dynamic_dit_loading
+        self.checkpoint_dir = checkpoint_dir
+        self.device_id = device_id
+        self.convert_model_dtype = convert_model_dtype
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -110,49 +117,65 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        # Store model configuration for dynamic loading
+        self.use_sp = use_sp
+        self.dit_fsdp = dit_fsdp
+        self.shard_fn = shard_fn
 
-        # Load models to CPU if using RamTorch
-        if self.use_ramtorch:
-            self.low_noise_model = WanModel.from_pretrained(
-                checkpoint_dir, subfolder=config.low_noise_checkpoint,
-                device_map='cpu')
-            self.high_noise_model = WanModel.from_pretrained(
-                checkpoint_dir, subfolder=config.high_noise_checkpoint,
-                device_map='cpu')
+        if self.dynamic_dit_loading:
+            logging.info(f"Dynamic DiT loading enabled - models will be loaded on demand")
+            # Store model paths but don't load models yet
+            self.low_noise_checkpoint = os.path.join(checkpoint_dir, config.low_noise_checkpoint)
+            self.high_noise_checkpoint = os.path.join(checkpoint_dir, config.high_noise_checkpoint)
+
+            # Initialize model references
+            self.low_noise_model = None
+            self.high_noise_model = None
+            self.current_model_type = None  # Track which model is currently loaded
         else:
-            self.low_noise_model = WanModel.from_pretrained(
-                checkpoint_dir, subfolder=config.low_noise_checkpoint)
-            self.high_noise_model = WanModel.from_pretrained(
-                checkpoint_dir, subfolder=config.high_noise_checkpoint)
+            logging.info(f"Creating WanModel from {checkpoint_dir}")
 
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            # Load models to CPU if using RamTorch
+            if self.use_ramtorch:
+                self.low_noise_model = WanModel.from_pretrained(
+                    checkpoint_dir, subfolder=config.low_noise_checkpoint,
+                    device_map='cpu')
+                self.high_noise_model = WanModel.from_pretrained(
+                    checkpoint_dir, subfolder=config.high_noise_checkpoint,
+                    device_map='cpu')
+            else:
+                self.low_noise_model = WanModel.from_pretrained(
+                    checkpoint_dir, subfolder=config.low_noise_checkpoint)
+                self.high_noise_model = WanModel.from_pretrained(
+                    checkpoint_dir, subfolder=config.high_noise_checkpoint)
 
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            self.low_noise_model = self._configure_model(
+                model=self.low_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
 
-        # Apply RamTorch replacement if enabled
-        if self.use_ramtorch:
-            self.low_noise_model = self._apply_ramtorch(self.low_noise_model, device_id)
-            self.high_noise_model = self._apply_ramtorch(self.high_noise_model, device_id)
+            self.high_noise_model = self._configure_model(
+                model=self.high_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
 
-            # Offload VAE to CPU to save GPU memory
-            logging.info("Offloading VAE to CPU for RamTorch memory optimization")
-            self.vae.model = self.vae.model.cpu()
-            self.vae.mean = self.vae.mean.cpu()
-            self.vae.std = self.vae.std.cpu()
-            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
-            self.vae.device = torch.device('cpu')
-            logging.info("VAE offloaded to CPU")
+            # Apply RamTorch replacement if enabled
+            if self.use_ramtorch:
+                self.low_noise_model = self._apply_ramtorch(self.low_noise_model, device_id)
+                self.high_noise_model = self._apply_ramtorch(self.high_noise_model, device_id)
+
+                # Offload VAE to CPU to save GPU memory
+                logging.info("Offloading VAE to CPU for RamTorch memory optimization")
+                self.vae.model = self.vae.model.cpu()
+                self.vae.mean = self.vae.mean.cpu()
+                self.vae.std = self.vae.std.cpu()
+                self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                self.vae.device = torch.device('cpu')
+                logging.info("VAE offloaded to CPU")
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -279,6 +302,124 @@ class WanI2V:
         logging.info("RamTorch optimization applied successfully.")
         return model
 
+    def _clear_gpu_memory(self):
+        """Clear GPU memory cache and synchronize."""
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _unload_model(self, model_type):
+        """
+        Completely unload a model from memory with aggressive cleanup.
+
+        Args:
+            model_type: 'low' or 'high' to specify which model to unload
+        """
+        if model_type == 'low':
+            model = self.low_noise_model
+            model_name = "low_noise_model"
+        else:
+            model = self.high_noise_model
+            model_name = "high_noise_model"
+
+        if model is None:
+            return
+
+        logging.info(f"Unloading {model_name}...")
+
+        # Memory before unloading
+        mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
+
+        # Handle RamTorch cleanup if applicable
+        if self.use_ramtorch and hasattr(model, 'blocks'):
+            # Clear all block references for RamTorch models
+            for i in range(len(model.blocks)):
+                # Move block to CPU if it's not already there
+                if hasattr(model.blocks[i], 'to'):
+                    model.blocks[i] = model.blocks[i].cpu()
+                model.blocks[i] = None
+            model.blocks.clear()
+
+        # Move entire model to CPU before deletion
+        if hasattr(model, 'to'):
+            model = model.cpu()
+
+        # Delete the model
+        if model_type == 'low':
+            del self.low_noise_model
+            self.low_noise_model = None
+        else:
+            del self.high_noise_model
+            self.high_noise_model = None
+
+        del model
+
+        # Aggressive memory cleanup
+        self._clear_gpu_memory()
+
+        # Memory after unloading
+        mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
+        logging.info(f"Unloaded {model_name}. GPU memory: {mem_before:.2f}GB -> {mem_after:.2f}GB (freed {mem_before - mem_after:.2f}GB)")
+
+    def _load_model_dynamic(self, model_type):
+        """
+        Dynamically load a model on demand.
+
+        Args:
+            model_type: 'low' or 'high' to specify which model to load
+
+        Returns:
+            The loaded and configured model
+        """
+        if model_type == 'low':
+            if self.low_noise_model is not None:
+                return self.low_noise_model
+            checkpoint_path = self.low_noise_checkpoint
+            model_name = "low_noise_model"
+        else:
+            if self.high_noise_model is not None:
+                return self.high_noise_model
+            checkpoint_path = self.high_noise_checkpoint
+            model_name = "high_noise_model"
+
+        logging.info(f"Loading {model_name} from {checkpoint_path}...")
+        mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
+
+        # Load model to CPU if using RamTorch or init_on_cpu
+        if self.use_ramtorch or self.init_on_cpu:
+            model = WanModel.from_pretrained(
+                self.checkpoint_dir,
+                subfolder=os.path.basename(checkpoint_path),
+                device_map='cpu')
+        else:
+            model = WanModel.from_pretrained(
+                self.checkpoint_dir,
+                subfolder=os.path.basename(checkpoint_path))
+
+        # Configure the model
+        model = self._configure_model(
+            model=model,
+            use_sp=self.use_sp,
+            dit_fsdp=self.dit_fsdp,
+            shard_fn=self.shard_fn,
+            convert_model_dtype=self.convert_model_dtype)
+
+        # Apply RamTorch if enabled
+        if self.use_ramtorch:
+            model = self._apply_ramtorch(model, self.device_id)
+
+        # Store the model
+        if model_type == 'low':
+            self.low_noise_model = model
+        else:
+            self.high_noise_model = model
+
+        mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
+        logging.info(f"Loaded {model_name}. GPU memory: {mem_before:.2f}GB -> {mem_after:.2f}GB (used {mem_after - mem_before:.2f}GB)")
+
+        return model
+
     def _prepare_model_for_timestep(self, t, boundary, offload_model):
         r"""
         Prepares and returns the required model for the current timestep.
@@ -297,12 +438,32 @@ class WanI2V:
                 The active model on the target device for the current timestep.
         """
         if t.item() >= boundary:
+            required_model_type = 'high'
             required_model_name = 'high_noise_model'
             offload_model_name = 'low_noise_model'
         else:
+            required_model_type = 'low'
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
 
+        # Dynamic loading mode - load only the needed model
+        if self.dynamic_dit_loading:
+            # Check if we need to switch models
+            if self.current_model_type != required_model_type:
+                # Unload the current model if there is one
+                if self.current_model_type is not None:
+                    opposite_type = 'low' if self.current_model_type == 'high' else 'high'
+                    self._unload_model(opposite_type)
+
+                # Load the required model
+                model = self._load_model_dynamic(required_model_type)
+                self.current_model_type = required_model_type
+                return model
+            else:
+                # Return the already loaded model
+                return getattr(self, required_model_name)
+
+        # Original behavior for non-dynamic mode
         # When using RamTorch, models stay on CPU and RamTorch handles GPU transfers internally
         if not self.use_ramtorch and (offload_model or self.init_on_cpu):
             if next(getattr(
@@ -415,16 +576,19 @@ class WanI2V:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
+            if offload_model or self.dynamic_dit_loading:
+                # Offload text encoder to free memory for DiT models
                 self.text_encoder.model.cpu()
+                if self.dynamic_dit_loading:
+                    logging.info("Text encoder offloaded to CPU to free memory for DiT models")
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        # Move VAE to GPU if using RamTorch
-        if self.use_ramtorch:
+        # Move VAE to GPU if using RamTorch or dynamic loading
+        if self.use_ramtorch or self.dynamic_dit_loading:
             self.vae.model = self.vae.model.to(self.device)
             self.vae.mean = self.vae.mean.to(self.device)
             self.vae.std = self.vae.std.to(self.device)
@@ -442,8 +606,8 @@ class WanI2V:
         ])[0]
         y = torch.concat([msk, y])
 
-        # Move VAE back to CPU after encoding if using RamTorch
-        if self.use_ramtorch:
+        # Move VAE back to CPU after encoding if using RamTorch or dynamic loading
+        if self.use_ramtorch or self.dynamic_dit_loading:
             self.vae.model = self.vae.model.cpu()
             self.vae.mean = self.vae.mean.cpu()
             self.vae.std = self.vae.std.cpu()
@@ -540,22 +704,33 @@ class WanI2V:
                 x0 = [latent]
                 del latent_model_input, timestep
 
-            if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
+            # Clean up models after inference
+            if self.dynamic_dit_loading:
+                logging.info("Unloading all DiT models after inference...")
+                if self.low_noise_model is not None:
+                    self._unload_model('low')
+                if self.high_noise_model is not None:
+                    self._unload_model('high')
+                self.current_model_type = None
+                self._clear_gpu_memory()
+            elif offload_model:
+                if self.low_noise_model is not None:
+                    self.low_noise_model.cpu()
+                if self.high_noise_model is not None:
+                    self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                # Move VAE to GPU if using RamTorch
-                if self.use_ramtorch:
+                # Move VAE to GPU if using RamTorch or dynamic loading
+                if self.use_ramtorch or self.dynamic_dit_loading:
                     self.vae.model = self.vae.model.to(self.device)
                     self.vae.mean = self.vae.mean.to(self.device)
                     self.vae.std = self.vae.std.to(self.device)
                     self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
                     self.vae.device = self.device
                 videos = self.vae.decode(x0)
-                # Move VAE back to CPU after decoding if using RamTorch
-                if self.use_ramtorch:
+                # Move VAE back to CPU after decoding if using RamTorch or dynamic loading
+                if self.use_ramtorch or self.dynamic_dit_loading:
                     self.vae.model = self.vae.model.cpu()
                     self.vae.mean = self.vae.mean.cpu()
                     self.vae.std = self.vae.std.cpu()
@@ -564,7 +739,7 @@ class WanI2V:
 
         del noise, latent, x0
         del sample_scheduler
-        if offload_model:
+        if offload_model or self.dynamic_dit_loading:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():

@@ -150,6 +150,12 @@ def _parse_args():
         help="Whether to offload the model to CPU after each model forward, reducing GPU memory usage."
     )
     parser.add_argument(
+        "--dynamic_dit_loading",
+        action="store_true",
+        default=False,
+        help="Load only one DiT model at a time during inference, switching between high/low noise models as needed."
+    )
+    parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
@@ -545,6 +551,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_ramtorch=args.use_ramtorch,
+            dynamic_dit_loading=args.dynamic_dit_loading,
         )
         logging.info("Generating video ...")
         video = wan_i2v.generate(
