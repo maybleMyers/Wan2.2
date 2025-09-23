@@ -118,7 +118,10 @@ class WanT2V:
         self.boundary = config.boundary
         self.param_dtype = config.param_dtype
 
-        if t5_fsdp or dit_fsdp or use_sp:
+        # When using RamTorch, keep models on CPU (RamTorch handles device placement)
+        if use_ramtorch:
+            self.init_on_cpu = True
+        elif t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
