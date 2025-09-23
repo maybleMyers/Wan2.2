@@ -730,7 +730,23 @@ class WanT2V:
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
+                # Temporarily move VAE to GPU if using RamTorch
+                if self.use_ramtorch:
+                    self.vae.model = self.vae.model.to(self.device)
+                    self.vae.mean = self.vae.mean.to(self.device)
+                    self.vae.std = self.vae.std.to(self.device)
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = self.device
+
                 videos = self.vae.decode(x0)
+
+                # Move VAE back to CPU after decoding if using RamTorch
+                if self.use_ramtorch:
+                    self.vae.model = self.vae.model.cpu()
+                    self.vae.mean = self.vae.mean.cpu()
+                    self.vae.std = self.vae.std.cpu()
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = torch.device('cpu')
 
         del noise, latents
         del sample_scheduler
