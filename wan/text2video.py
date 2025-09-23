@@ -145,9 +145,11 @@ class WanT2V:
         self.patch_size = config.patch_size
         # Use individual VAE path if provided, otherwise use checkpoint directory
         vae_pth = self.vae_path if self.vae_path else os.path.join(checkpoint_dir, config.vae_checkpoint)
+        # When using RamTorch, initialize VAE on CPU to save GPU memory
+        vae_device = torch.device('cpu') if use_ramtorch else self.device
         self.vae = Wan2_1_VAE(
             vae_pth=vae_pth,
-            device=self.device)
+            device=vae_device)
 
         # Store model configuration for potential dynamic loading
         self.use_sp = use_sp
@@ -258,6 +260,16 @@ class WanT2V:
             if self.use_ramtorch:
                 self.low_noise_model = self._apply_ramtorch(self.low_noise_model, device_id)
                 self.high_noise_model = self._apply_ramtorch(self.high_noise_model, device_id)
+
+                # Offload VAE to CPU to save GPU memory
+                logging.info("Offloading VAE to CPU for RamTorch memory optimization")
+                self.vae.model = self.vae.model.cpu()
+                # Also move VAE scale tensors to CPU
+                self.vae.mean = self.vae.mean.cpu()
+                self.vae.std = self.vae.std.cpu()
+                self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                self.vae.device = torch.device('cpu')
+                logging.info("VAE offloaded to CPU")
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -364,6 +376,19 @@ class WanT2V:
                     if has_params or has_buffers:
                         child.to(cuda_device)
                         logging.info(f"Moved {name} ({type(child).__name__}) to GPU")
+
+            # Also handle direct parameters of the module (not in child modules)
+            for name, param in module.named_parameters(recurse=False):
+                if param.device != cuda_device:
+                    # This handles loose parameters not in submodules
+                    setattr(module, name, nn.Parameter(param.to(cuda_device)))
+                    logging.info(f"Moved parameter {name} to GPU")
+
+            # Handle buffers as well
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer.device != cuda_device:
+                    module.register_buffer(name, buffer.to(cuda_device))
+                    logging.info(f"Moved buffer {name} to GPU")
 
         move_non_linear_to_gpu(model)
 
