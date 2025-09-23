@@ -171,7 +171,15 @@ class WanT2V:
                 if path_or_dir and os.path.isfile(path_or_dir) and (path_or_dir.endswith('.safetensors') or path_or_dir.endswith('.pth')):
                     logging.info(f"Loading model from file: {path_or_dir}")
 
-                    # Create model instance using config
+                    # Load weights first
+                    if path_or_dir.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(path_or_dir, device='cpu')
+                    else:
+                        state_dict = torch.load(path_or_dir, map_location='cpu')
+
+                    # Create model instance - initialize with the main dtype (bf16)
+                    # but some layers will be fp32 as defined in WanModel's initialization
                     model = WanModel(
                         model_type="t2v",  # for t2v-A14B
                         patch_size=self.config.patch_size,
@@ -189,14 +197,11 @@ class WanT2V:
                         eps=self.config.eps,
                     )
 
-                    # Load weights
-                    if path_or_dir.endswith('.safetensors'):
-                        from safetensors.torch import load_file
-                        state_dict = load_file(path_or_dir, device='cpu' if self.use_ramtorch else str(self.device))
-                    else:
-                        state_dict = torch.load(path_or_dir, map_location='cpu' if self.use_ramtorch else self.device)
+                    # Convert model to the main dtype (bf16) while preserving specific layers in fp32
+                    # This matches what the original model saving would have done
+                    model = model.to(dtype=self.config.param_dtype)
 
-                    # Load state dict into model
+                    # Now load the state dict - this will override with the correct mixed dtypes
                     model.load_state_dict(state_dict, strict=True)
 
                     # Move to appropriate device if not using RamTorch
@@ -317,7 +322,15 @@ class WanT2V:
             # Load safetensors file directly
             logging.info(f"Loading safetensors/pth file directly from {checkpoint_path}")
 
-            # Create model instance using config
+            # Load weights first
+            if checkpoint_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(checkpoint_path, device='cpu')
+            else:
+                state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+            # Create model instance - initialize with the main dtype (bf16)
+            # but some layers will be fp32 as defined in WanModel's initialization
             model = WanModel(
                 model_type="t2v",  # for t2v-A14B
                 patch_size=self.config.patch_size,
@@ -335,14 +348,11 @@ class WanT2V:
                 eps=self.config.eps,
             )
 
-            # Load weights
-            if checkpoint_path.endswith('.safetensors'):
-                from safetensors.torch import load_file
-                state_dict = load_file(checkpoint_path, device='cpu' if (self.use_ramtorch or self.init_on_cpu) else str(self.device))
-            else:
-                state_dict = torch.load(checkpoint_path, map_location='cpu' if (self.use_ramtorch or self.init_on_cpu) else self.device)
+            # Convert model to the main dtype (bf16) while preserving specific layers in fp32
+            # This matches what the original model saving would have done
+            model = model.to(dtype=self.config.param_dtype)
 
-            # Load state dict into model
+            # Now load the state dict - this will override with the correct mixed dtypes
             model.load_state_dict(state_dict, strict=True)
 
             # Move to appropriate device if not already there
