@@ -147,7 +147,11 @@ class WanI2V:
 
             # Offload VAE to CPU to save GPU memory
             logging.info("Offloading VAE to CPU for RamTorch memory optimization")
-            self.vae = self.vae.to('cpu')
+            self.vae.model = self.vae.model.cpu()
+            self.vae.mean = self.vae.mean.cpu()
+            self.vae.std = self.vae.std.cpu()
+            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+            self.vae.device = torch.device('cpu')
             logging.info("VAE offloaded to CPU")
         if use_sp:
             self.sp_size = get_world_size()
@@ -419,7 +423,11 @@ class WanI2V:
 
         # Move VAE to GPU if using RamTorch
         if self.use_ramtorch:
-            self.vae = self.vae.to(self.device)
+            self.vae.model = self.vae.model.to(self.device)
+            self.vae.mean = self.vae.mean.to(self.device)
+            self.vae.std = self.vae.std.to(self.device)
+            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+            self.vae.device = self.device
 
         y = self.vae.encode([
             torch.concat([
@@ -434,7 +442,11 @@ class WanI2V:
 
         # Move VAE back to CPU after encoding if using RamTorch
         if self.use_ramtorch:
-            self.vae = self.vae.to('cpu')
+            self.vae.model = self.vae.model.cpu()
+            self.vae.mean = self.vae.mean.cpu()
+            self.vae.std = self.vae.std.cpu()
+            self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+            self.vae.device = torch.device('cpu')
 
         @contextmanager
         def noop_no_sync():
@@ -534,11 +546,19 @@ class WanI2V:
             if self.rank == 0:
                 # Move VAE to GPU if using RamTorch
                 if self.use_ramtorch:
-                    self.vae = self.vae.to(self.device)
+                    self.vae.model = self.vae.model.to(self.device)
+                    self.vae.mean = self.vae.mean.to(self.device)
+                    self.vae.std = self.vae.std.to(self.device)
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = self.device
                 videos = self.vae.decode(x0)
                 # Move VAE back to CPU after decoding if using RamTorch
                 if self.use_ramtorch:
-                    self.vae = self.vae.to('cpu')
+                    self.vae.model = self.vae.model.cpu()
+                    self.vae.mean = self.vae.mean.cpu()
+                    self.vae.std = self.vae.std.cpu()
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    self.vae.device = torch.device('cpu')
 
         del noise, latent, x0
         del sample_scheduler
