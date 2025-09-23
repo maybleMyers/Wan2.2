@@ -104,6 +104,11 @@ class WanT2V:
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
         self.use_ramtorch = use_ramtorch
+
+        # Force T5 to stay on CPU when using RamTorch
+        if use_ramtorch:
+            self.t5_cpu = True
+            logging.info("Forcing T5 to CPU for RamTorch memory optimization")
         self.dynamic_dit_loading = dynamic_dit_loading
         self.mixed_dtype = mixed_dtype
         self.convert_model_dtype = convert_model_dtype
