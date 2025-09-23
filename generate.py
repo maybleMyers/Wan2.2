@@ -488,6 +488,14 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            use_ramtorch=args.use_ramtorch,
+            dynamic_dit_loading=args.dynamic_dit_loading,
+            # Individual model paths
+            dit_low_noise_path=args.dit_low_noise,
+            dit_high_noise_path=args.dit_high_noise,
+            vae_path=args.vae,
+            t5_path=args.t5,
+            mixed_dtype=args.mixed_dtype,
         )
 
         logging.info(f"Generating video ...")

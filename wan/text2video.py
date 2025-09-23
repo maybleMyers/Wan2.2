@@ -42,6 +42,14 @@ class WanT2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        use_ramtorch=False,
+        dynamic_dit_loading=False,
+        # Individual model paths for single safetensors loading
+        dit_low_noise_path=None,
+        dit_high_noise_path=None,
+        vae_path=None,
+        t5_path=None,
+        mixed_dtype=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -68,12 +76,35 @@ class WanT2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            use_ramtorch (`bool`, *optional*, defaults to False):
+                Whether to use RamTorch memory optimization for inference.
+            dynamic_dit_loading (`bool`, *optional*, defaults to False):
+                Load only one DiT model at a time during inference.
+            dit_low_noise_path (`str`, *optional*):
+                Path to low noise DiT model checkpoint (safetensors or pth file).
+            dit_high_noise_path (`str`, *optional*):
+                Path to high noise DiT model checkpoint (safetensors or pth file).
+            vae_path (`str`, *optional*):
+                Path to VAE checkpoint (safetensors or pth file).
+            t5_path (`str`, *optional*):
+                Path to T5 text encoder checkpoint (safetensors or pth file).
+            mixed_dtype (`bool`, *optional*, defaults to False):
+                Preserve original weight dtypes when loading models.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.use_ramtorch = use_ramtorch
+        self.dynamic_dit_loading = dynamic_dit_loading
+        self.mixed_dtype = mixed_dtype
+
+        # Store individual model paths
+        self.dit_low_noise_path = dit_low_noise_path
+        self.dit_high_noise_path = dit_high_noise_path
+        self.vae_path = vae_path
+        self.t5_path = t5_path
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -83,38 +114,129 @@ class WanT2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
+        # Use individual T5 path if provided, otherwise use checkpoint directory
+        if self.t5_path:
+            t5_checkpoint_path = self.t5_path
+            t5_tokenizer_path = config.t5_tokenizer if hasattr(config, 't5_tokenizer') else "google/umt5-xxl"
+        else:
+            t5_checkpoint_path = os.path.join(checkpoint_dir, config.t5_checkpoint)
+            t5_tokenizer_path = os.path.join(checkpoint_dir, config.t5_tokenizer)
+
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            checkpoint_path=t5_checkpoint_path,
+            tokenizer_path=t5_tokenizer_path,
             shard_fn=shard_fn if t5_fsdp else None)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
+        # Use individual VAE path if provided, otherwise use checkpoint directory
+        vae_pth = self.vae_path if self.vae_path else os.path.join(checkpoint_dir, config.vae_checkpoint)
         self.vae = Wan2_1_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=vae_pth,
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        # Store model configuration for potential dynamic loading
+        self.use_sp = use_sp
+        self.dit_fsdp = dit_fsdp
+        self.shard_fn = shard_fn
+        self.checkpoint_dir = checkpoint_dir
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        if self.dynamic_dit_loading:
+            logging.info(f"Dynamic DiT loading enabled - models will be loaded on demand")
+            # Store model paths - use individual paths if provided, otherwise use checkpoint directory
+            if self.dit_low_noise_path and self.dit_high_noise_path:
+                self.low_noise_checkpoint = self.dit_low_noise_path
+                self.high_noise_checkpoint = self.dit_high_noise_path
+                logging.info(f"Using individual DiT model paths:")
+                logging.info(f"  Low noise: {self.low_noise_checkpoint}")
+                logging.info(f"  High noise: {self.high_noise_checkpoint}")
+            else:
+                self.low_noise_checkpoint = os.path.join(checkpoint_dir, config.low_noise_checkpoint)
+                self.high_noise_checkpoint = os.path.join(checkpoint_dir, config.high_noise_checkpoint)
+
+            # Initialize model references
+            self.low_noise_model = None
+            self.high_noise_model = None
+            self.current_model_type = None  # Track which model is currently loaded
+        else:
+            logging.info(f"Creating WanModel...")
+
+            # Helper function to load model from either file or directory
+            def _load_wan_model(path_or_dir, subfolder=None):
+                # Check if individual path is provided and is a file
+                if path_or_dir and os.path.isfile(path_or_dir) and (path_or_dir.endswith('.safetensors') or path_or_dir.endswith('.pth')):
+                    logging.info(f"Loading model from file: {path_or_dir}")
+
+                    # Create model instance using config
+                    model = WanModel(
+                        model_type="t2v",  # for t2v-A14B
+                        patch_size=self.config.patch_size,
+                        text_len=self.config.text_len,
+                        in_dim=16,  # Standard VAE latent channels
+                        dim=self.config.dim,
+                        ffn_dim=self.config.ffn_dim,
+                        freq_dim=self.config.freq_dim,
+                        text_dim=4096,  # Standard T5 dimension
+                        num_heads=self.config.num_heads,
+                        num_layers=self.config.num_layers,
+                        window_size=self.config.window_size,
+                        qk_norm=self.config.qk_norm,
+                        cross_attn_norm=self.config.cross_attn_norm,
+                        eps=self.config.eps,
+                    )
+
+                    # Load weights
+                    if path_or_dir.endswith('.safetensors'):
+                        from safetensors.torch import load_file
+                        state_dict = load_file(path_or_dir, device='cpu' if self.use_ramtorch else str(self.device))
+                    else:
+                        state_dict = torch.load(path_or_dir, map_location='cpu' if self.use_ramtorch else self.device)
+
+                    # Load state dict into model
+                    model.load_state_dict(state_dict, strict=True)
+
+                    # Move to appropriate device if not using RamTorch
+                    if not self.use_ramtorch:
+                        model = model.to(self.device)
+
+                    return model
+
+                # Fall back to directory loading
+                if self.use_ramtorch:
+                    return WanModel.from_pretrained(checkpoint_dir, subfolder=subfolder, device_map='cpu')
+                else:
+                    return WanModel.from_pretrained(checkpoint_dir, subfolder=subfolder)
+
+            # Load low noise model
+            if self.dit_low_noise_path:
+                logging.info(f"Loading low noise model from {self.dit_low_noise_path}")
+                self.low_noise_model = _load_wan_model(self.dit_low_noise_path)
+            else:
+                self.low_noise_model = _load_wan_model(checkpoint_dir, config.low_noise_checkpoint)
+
+            self.low_noise_model = self._configure_model(
+                model=self.low_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
+
+            # Load high noise model
+            if self.dit_high_noise_path:
+                logging.info(f"Loading high noise model from {self.dit_high_noise_path}")
+                self.high_noise_model = _load_wan_model(self.dit_high_noise_path)
+            else:
+                self.high_noise_model = _load_wan_model(checkpoint_dir, config.high_noise_checkpoint)
+
+            self.high_noise_model = self._configure_model(
+                model=self.high_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -166,6 +288,107 @@ class WanT2V:
 
         return model
 
+    def _load_model_dynamic(self, model_type):
+        """
+        Dynamically load a model on demand (for dynamic loading mode).
+
+        Args:
+            model_type: 'low' or 'high' to specify which model to load
+
+        Returns:
+            The loaded and configured model
+        """
+        if model_type == 'low':
+            if self.low_noise_model is not None:
+                return self.low_noise_model
+            checkpoint_path = self.low_noise_checkpoint
+            model_name = "low_noise_model"
+        else:
+            if self.high_noise_model is not None:
+                return self.high_noise_model
+            checkpoint_path = self.high_noise_checkpoint
+            model_name = "high_noise_model"
+
+        logging.info(f"Loading {model_name} from {checkpoint_path}...")
+
+        # Check if this is a single file (safetensors/pth) or a directory
+        if os.path.isfile(checkpoint_path) and (checkpoint_path.endswith('.safetensors') or checkpoint_path.endswith('.pth')):
+            # Load safetensors file directly
+            logging.info(f"Loading safetensors/pth file directly from {checkpoint_path}")
+
+            # Create model instance using config
+            model = WanModel(
+                model_type="t2v",  # for t2v-A14B
+                patch_size=self.config.patch_size,
+                text_len=self.config.text_len,
+                in_dim=16,  # Standard VAE latent channels
+                dim=self.config.dim,
+                ffn_dim=self.config.ffn_dim,
+                freq_dim=self.config.freq_dim,
+                text_dim=4096,  # Standard T5 dimension
+                num_heads=self.config.num_heads,
+                num_layers=self.config.num_layers,
+                window_size=self.config.window_size,
+                qk_norm=self.config.qk_norm,
+                cross_attn_norm=self.config.cross_attn_norm,
+                eps=self.config.eps,
+            )
+
+            # Load weights
+            if checkpoint_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(checkpoint_path, device='cpu' if (self.use_ramtorch or self.init_on_cpu) else str(self.device))
+            else:
+                state_dict = torch.load(checkpoint_path, map_location='cpu' if (self.use_ramtorch or self.init_on_cpu) else self.device)
+
+            # Load state dict into model
+            model.load_state_dict(state_dict, strict=True)
+
+            # Move to appropriate device if not already there
+            if not (self.use_ramtorch or self.init_on_cpu):
+                model = model.to(self.device)
+        else:
+            # Load from directory structure (original behavior)
+            if self.use_ramtorch or self.init_on_cpu:
+                model = WanModel.from_pretrained(
+                    self.checkpoint_dir,
+                    subfolder=os.path.basename(checkpoint_path),
+                    device_map='cpu')
+            else:
+                model = WanModel.from_pretrained(
+                    self.checkpoint_dir,
+                    subfolder=os.path.basename(checkpoint_path))
+
+        # Configure the model
+        model = self._configure_model(
+            model=model,
+            use_sp=self.use_sp,
+            dit_fsdp=self.dit_fsdp,
+            shard_fn=self.shard_fn,
+            convert_model_dtype=self.convert_model_dtype)
+
+        # Store the model
+        if model_type == 'low':
+            self.low_noise_model = model
+        else:
+            self.high_noise_model = model
+
+        return model
+
+    def _unload_model(self, model_type):
+        """Unload a model to free memory."""
+        if model_type == 'low':
+            if self.low_noise_model is not None:
+                self.low_noise_model = self.low_noise_model.cpu()
+                self.low_noise_model = None
+        else:
+            if self.high_noise_model is not None:
+                self.high_noise_model = self.high_noise_model.cpu()
+                self.high_noise_model = None
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
     def _prepare_model_for_timestep(self, t, boundary, offload_model):
         r"""
         Prepares and returns the required model for the current timestep.
@@ -184,11 +407,31 @@ class WanT2V:
                 The active model on the target device for the current timestep.
         """
         if t.item() >= boundary:
+            required_model_type = 'high'
             required_model_name = 'high_noise_model'
             offload_model_name = 'low_noise_model'
         else:
+            required_model_type = 'low'
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
+
+        # Dynamic loading mode - load only the needed model
+        if self.dynamic_dit_loading:
+            # Check if we need to switch models
+            if self.current_model_type != required_model_type:
+                # Unload the current model if there is one
+                if self.current_model_type is not None:
+                    self._unload_model(self.current_model_type)
+
+                # Load the required model
+                model = self._load_model_dynamic(required_model_type)
+                self.current_model_type = required_model_type
+                return model
+            else:
+                # Return the already loaded model
+                return getattr(self, required_model_name)
+
+        # Original behavior for non-dynamic mode
         if offload_model or self.init_on_cpu:
             if next(getattr(
                     self,
