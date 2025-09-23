@@ -302,7 +302,9 @@ class WanI2V:
         else:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
-        if offload_model or self.init_on_cpu:
+
+        # When using RamTorch, models stay on CPU and RamTorch handles GPU transfers internally
+        if not self.use_ramtorch and (offload_model or self.init_on_cpu):
             if next(getattr(
                     self,
                     offload_model_name).parameters()).device.type == 'cuda':
