@@ -331,15 +331,16 @@ class WanI2V:
         # Memory before unloading
         mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
 
-        # Handle RamTorch cleanup if applicable
-        if self.use_ramtorch and hasattr(model, 'blocks'):
-            # Clear all block references for RamTorch models
+        # Clear block references if they exist
+        if hasattr(model, 'blocks') and model.blocks is not None:
+            # Clear all block references
             for i in range(len(model.blocks)):
                 # Move block to CPU if it's not already there
                 if hasattr(model.blocks[i], 'to'):
                     model.blocks[i] = model.blocks[i].cpu()
                 model.blocks[i] = None
-            model.blocks.clear()
+            # Set blocks to None instead of calling clear() (ModuleList doesn't have clear())
+            model.blocks = None
 
         # Move entire model to CPU before deletion
         if hasattr(model, 'to'):
@@ -452,8 +453,8 @@ class WanI2V:
             if self.current_model_type != required_model_type:
                 # Unload the current model if there is one
                 if self.current_model_type is not None:
-                    opposite_type = 'low' if self.current_model_type == 'high' else 'high'
-                    self._unload_model(opposite_type)
+                    # Unload the CURRENT model, not the opposite one!
+                    self._unload_model(self.current_model_type)
 
                 # Load the required model
                 model = self._load_model_dynamic(required_model_type)
