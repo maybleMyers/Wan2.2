@@ -196,21 +196,48 @@ class WanI2V:
             self.high_noise_model = None
             self.current_model_type = None  # Track which model is currently loaded
         else:
-            logging.info(f"Creating WanModel from {checkpoint_dir}")
+            logging.info(f"Creating WanModel...")
 
-            # Load models to CPU if using RamTorch
-            if self.use_ramtorch:
-                self.low_noise_model = WanModel.from_pretrained(
-                    checkpoint_dir, subfolder=config.low_noise_checkpoint,
-                    device_map='cpu')
-                self.high_noise_model = WanModel.from_pretrained(
-                    checkpoint_dir, subfolder=config.high_noise_checkpoint,
-                    device_map='cpu')
+            # Helper function to load model from either file or directory
+            def _load_wan_model(path_or_dir, subfolder=None):
+                # Check if individual path is provided and is a file
+                if path_or_dir and os.path.isfile(path_or_dir) and (path_or_dir.endswith('.safetensors') or path_or_dir.endswith('.pth')):
+                    try:
+                        from .modules.ram_model import load_wan_model
+                        loading_device = 'cpu' if self.use_ramtorch else self.device
+                        loading_weight_dtype = None if self.mixed_dtype else self.param_dtype
+                        return load_wan_model(
+                            config=self.config,
+                            device=self.device,
+                            dit_path=path_or_dir,
+                            attn_mode='sdpa',
+                            split_attn=False,
+                            loading_device=loading_device,
+                            dit_weight_dtype=loading_weight_dtype,
+                            fp8_scaled=False,
+                        )
+                    except ImportError:
+                        logging.warning("ram_model not found, falling back to from_pretrained")
+
+                # Fall back to directory loading
+                if self.use_ramtorch:
+                    return WanModel.from_pretrained(checkpoint_dir, subfolder=subfolder, device_map='cpu')
+                else:
+                    return WanModel.from_pretrained(checkpoint_dir, subfolder=subfolder)
+
+            # Load low noise model
+            if self.dit_low_noise_path:
+                logging.info(f"Loading low noise model from {self.dit_low_noise_path}")
+                self.low_noise_model = _load_wan_model(self.dit_low_noise_path)
             else:
-                self.low_noise_model = WanModel.from_pretrained(
-                    checkpoint_dir, subfolder=config.low_noise_checkpoint)
-                self.high_noise_model = WanModel.from_pretrained(
-                    checkpoint_dir, subfolder=config.high_noise_checkpoint)
+                self.low_noise_model = _load_wan_model(checkpoint_dir, config.low_noise_checkpoint)
+
+            # Load high noise model
+            if self.dit_high_noise_path:
+                logging.info(f"Loading high noise model from {self.dit_high_noise_path}")
+                self.high_noise_model = _load_wan_model(self.dit_high_noise_path)
+            else:
+                self.high_noise_model = _load_wan_model(checkpoint_dir, config.high_noise_checkpoint)
 
             self.low_noise_model = self._configure_model(
                 model=self.low_noise_model,
@@ -450,16 +477,48 @@ class WanI2V:
         logging.info(f"Loading {model_name} from {checkpoint_path}...")
         mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
 
-        # Load model to CPU if using RamTorch or init_on_cpu
-        if self.use_ramtorch or self.init_on_cpu:
-            model = WanModel.from_pretrained(
-                self.checkpoint_dir,
-                subfolder=os.path.basename(checkpoint_path),
-                device_map='cpu')
+        # Check if this is a single file (safetensors/pth) or a directory
+        if os.path.isfile(checkpoint_path) and (checkpoint_path.endswith('.safetensors') or checkpoint_path.endswith('.pth')):
+            # Use load_wan_model from ram_model for single file loading
+            try:
+                from .modules.ram_model import load_wan_model
+
+                loading_device = 'cpu' if (self.use_ramtorch or self.init_on_cpu) else self.device
+                loading_weight_dtype = None if self.mixed_dtype else self.param_dtype
+
+                model = load_wan_model(
+                    config=self.config,
+                    device=self.device,
+                    dit_path=checkpoint_path,
+                    attn_mode='sdpa',  # Default attention mode
+                    split_attn=False,
+                    loading_device=loading_device,
+                    dit_weight_dtype=loading_weight_dtype,
+                    fp8_scaled=False,
+                )
+            except ImportError:
+                logging.warning("ram_model not found, falling back to from_pretrained")
+                # Fallback to from_pretrained with directory structure
+                if self.use_ramtorch or self.init_on_cpu:
+                    model = WanModel.from_pretrained(
+                        self.checkpoint_dir,
+                        subfolder=os.path.basename(checkpoint_path),
+                        device_map='cpu')
+                else:
+                    model = WanModel.from_pretrained(
+                        self.checkpoint_dir,
+                        subfolder=os.path.basename(checkpoint_path))
         else:
-            model = WanModel.from_pretrained(
-                self.checkpoint_dir,
-                subfolder=os.path.basename(checkpoint_path))
+            # Load from directory structure (original behavior)
+            if self.use_ramtorch or self.init_on_cpu:
+                model = WanModel.from_pretrained(
+                    self.checkpoint_dir,
+                    subfolder=os.path.basename(checkpoint_path),
+                    device_map='cpu')
+            else:
+                model = WanModel.from_pretrained(
+                    self.checkpoint_dir,
+                    subfolder=os.path.basename(checkpoint_path))
 
         # Configure the model
         model = self._configure_model(
