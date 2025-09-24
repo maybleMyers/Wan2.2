@@ -460,12 +460,10 @@ class WanModel(ModelMixin, ConfigMixin):
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
         with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+                sinusoidal_embedding_1d(self.freq_dim, t).float()
+            ).unsqueeze(1)  # Shape becomes [B, 1, C]
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))  # Shape becomes [B, 1, 6, C]
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
