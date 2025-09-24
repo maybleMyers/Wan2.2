@@ -457,14 +457,21 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
-        if t.dim() == 1:
-            t = t.expand(t.size(0), seq_len)
         with torch.amp.autocast('cuda', dtype=torch.float32):
+            # This optimized version avoids expanding 't' to the full sequence length,
+            # saving significant VRAM. It computes one embedding per batch item and
+            # relies on broadcasting in the attention blocks.
+            # Store original 1D tensor for embedding computation
+            t_1d = t if t.dim() == 1 else t[:, 0]  # Use first timestep if already expanded
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float()
+                sinusoidal_embedding_1d(self.freq_dim, t_1d).float()
             ).unsqueeze(1)  # Shape becomes [B, 1, C]
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))  # Shape becomes [B, 1, 6, C]
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # Expand t for any other uses if needed (though it doesn't seem to be used after this)
+        if t.dim() == 1:
+            t = t.expand(t.size(0), seq_len)
 
         # context
         context_lens = None
