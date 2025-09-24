@@ -355,7 +355,7 @@ class WanT2V:
                     if child.bias is not None:
                         new_module.bias.data.copy_(child.bias.data.cpu())
                     setattr(module, name, new_module)
-                    logging.info(f"Replaced {name} with RamTorchLinear")
+                    # logging.info(f"Replaced {name} with RamTorchLinear")
                 elif len(list(child.children())) > 0:
                     # Recursively replace in child modules
                     replace_linear_with_ramtorch(child)
