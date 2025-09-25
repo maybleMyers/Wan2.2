@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 import types
 from contextlib import contextmanager
 from functools import partial
@@ -337,6 +338,7 @@ class WanT2V:
             return model
 
         logging.info("Applying RamTorch memory optimization...")
+        ramtorch_start_time = time.time()
         device = f"cuda:{device_id}"
         cuda_device = torch.device(device)
 
@@ -398,7 +400,8 @@ class WanT2V:
 
         move_non_linear_to_gpu(model)
 
-        logging.info("RamTorch optimization applied successfully.")
+        ramtorch_time = time.time() - ramtorch_start_time
+        logging.info(f"✅ RamTorch optimization applied successfully in {ramtorch_time:.2f} seconds")
         return model
 
     def _load_model_dynamic(self, model_type):
@@ -423,6 +426,7 @@ class WanT2V:
             model_name = "high_noise_model"
 
         logging.info(f"Loading {model_name} from {checkpoint_path}...")
+        model_loading_start = time.time()
 
         # Check if this is a single file (safetensors/pth) or a directory
         if os.path.isfile(checkpoint_path) and (checkpoint_path.endswith('.safetensors') or checkpoint_path.endswith('.pth')):
@@ -494,6 +498,9 @@ class WanT2V:
             self.low_noise_model = model
         else:
             self.high_noise_model = model
+
+        model_loading_time = time.time() - model_loading_start
+        logging.info(f"✅ {model_name} loaded successfully in {model_loading_time:.2f} seconds")
 
         return model
 
@@ -697,14 +704,23 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            # Create custom progress bar for inference only (excluding model loading)
+            inference_progress = tqdm(total=len(timesteps), desc="🎬 Generating video frames", unit="step")
+            inference_start_time = time.time()
+
+            for step_idx, t in enumerate(timesteps):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
+                # Model preparation (includes loading if dynamic) - not included in inference timing
                 model = self._prepare_model_for_timestep(
                     t, boundary, offload_model)
+
+                # Start timing inference step (after model loading)
+                step_start_time = time.time()
+
                 sample_guide_scale = guide_scale[1] if t.item(
                 ) >= boundary else guide_scale[0]
 
@@ -723,6 +739,18 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+
+                # Update progress after inference computation
+                step_time = time.time() - step_start_time
+                inference_progress.set_postfix({
+                    'step': f'{step_idx+1}/{len(timesteps)}',
+                    'step_time': f'{step_time:.2f}s'
+                })
+                inference_progress.update(1)
+
+            inference_progress.close()
+            total_inference_time = time.time() - inference_start_time
+            logging.info(f"🚀 Video generation completed in {total_inference_time:.2f} seconds (inference only)")
 
             x0 = latents
             if offload_model:
